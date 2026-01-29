@@ -1,0 +1,39 @@
+import glob
+import os.path
+
+rule all:
+    input:
+        "data/statistics.csv"
+
+rule fetch_species:
+    output:
+        "data/aves.json"
+    shell:
+        "python src/fetch_species.py --output-file={output}"
+
+rule import_species:
+    input:
+        "data/aves.json"
+    output:
+        touch("data/.db.done")
+    shell:
+        "python src/import_species.py --input-file={input}"
+
+AUDIO_FILES = glob.glob("data/audio/*")
+
+rule classify:
+    input:
+        "data/audio/{filename}"
+    output:
+        touch("data/audio/.{filename}.done")
+    shell:
+        "python src/classify.py --input-file=\"data/audio/{wildcards.filename}\""
+
+rule aggregate:
+    input:
+        "data/.db.done",
+        expand("data/audio/.{filename}.done", filename=[os.path.basename(f) for f in AUDIO_FILES])
+    output:
+        "data/statistics.csv",
+    shell:
+        "python src/aggregate.py --output-file={output}"
