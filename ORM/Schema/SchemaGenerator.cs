@@ -15,6 +15,18 @@ public class SchemaGenerator
         _connectionString = connectionString;
     }
 
+    private bool IsNavigationProperty(PropertyInfo prop)
+    {
+        var propType = prop.PropertyType;
+        if (propType.IsGenericType)
+        {
+            var genericDef = propType.GetGenericTypeDefinition();
+            if (genericDef == typeof(LazyLoader<>) || genericDef == typeof(LazyCollection<>))
+                return true;
+        }
+        return false;
+    }
+
     public string GenerateCreateTableSql(Type modelType)
     {
         var tableAttr = modelType.GetCustomAttribute<TableAttribute>();
@@ -23,8 +35,9 @@ public class SchemaGenerator
         var sb = new StringBuilder();
         sb.AppendLine($"CREATE TABLE IF NOT EXISTS {tableName} (");
 
-        var properties = modelType.GetProperties();
+        var properties = modelType.GetProperties().Where(p => !IsNavigationProperty(p)).ToArray();
         var columnDefs = new List<string>();
+        var foreignKeys = new List<string>();
 
         foreach (var prop in properties)
         {
@@ -32,6 +45,7 @@ public class SchemaGenerator
             var columnName = columnAttr?.Name ?? prop.Name.ToLower();
             var pgType = TypeMapper.GetPostgreSqlType(prop.PropertyType);
             var isPrimaryKey = prop.GetCustomAttribute<PrimaryKeyAttribute>() != null;
+            var fkAttr = prop.GetCustomAttribute<ForeignKeyAttribute>();
 
             var columnDef = $"    {columnName} {pgType}";
             if (isPrimaryKey)
@@ -43,9 +57,24 @@ public class SchemaGenerator
                 columnDef += " PRIMARY KEY";
             }
             columnDefs.Add(columnDef);
+
+            if (fkAttr != null)
+            {
+                var refTableAttr = fkAttr.ReferencedType.GetCustomAttribute<TableAttribute>();
+                var refTableName = refTableAttr?.Name ?? fkAttr.ReferencedType.Name.ToLower();
+                var refPkProp = fkAttr.ReferencedType.GetProperties()
+                    .FirstOrDefault(p => p.GetCustomAttribute<PrimaryKeyAttribute>() != null);
+                if (refPkProp != null)
+                {
+                    var refPkColAttr = refPkProp.GetCustomAttribute<ColumnAttribute>();
+                    var refPkColumn = refPkColAttr?.Name ?? refPkProp.Name.ToLower();
+                    foreignKeys.Add($"    FOREIGN KEY ({columnName}) REFERENCES {refTableName}({refPkColumn})");
+                }
+            }
         }
 
-        sb.AppendLine(string.Join(",\n", columnDefs));
+        var allDefs = columnDefs.Concat(foreignKeys);
+        sb.AppendLine(string.Join(",\n", allDefs));
         sb.Append(");");
 
         return sb.ToString();
@@ -58,9 +87,41 @@ public class SchemaGenerator
             .ToList();
     }
 
+    public List<Type> SortByDependencies(List<Type> models)
+    {
+        var sorted = new List<Type>();
+        var visited = new HashSet<Type>();
+
+        void Visit(Type type)
+        {
+            if (visited.Contains(type)) return;
+            visited.Add(type);
+
+            var props = type.GetProperties();
+            foreach (var prop in props)
+            {
+                var fkAttr = prop.GetCustomAttribute<ForeignKeyAttribute>();
+                if (fkAttr != null && models.Contains(fkAttr.ReferencedType))
+                {
+                    Visit(fkAttr.ReferencedType);
+                }
+            }
+            sorted.Add(type);
+        }
+
+        foreach (var model in models)
+        {
+            Visit(model);
+        }
+
+        return sorted;
+    }
+
     public void ExecuteMigration(Assembly assembly)
     {
         var models = DiscoverModels(assembly);
+        models = SortByDependencies(models);
+
         using var connection = new NpgsqlConnection(_connectionString);
         connection.Open();
 
